@@ -1,4 +1,4 @@
-backend/onnx_model
+backend/onnx_model/*.onnx
 backend/venv
 venv/
 
