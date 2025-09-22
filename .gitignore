@@ -1,3 +1,5 @@
 backend/onnx_model
 backend/venv
 venv/
+
+frontend/node_modules
