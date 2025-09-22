@@ -1,3 +1,3 @@
-cd backend --
--- pip install -r requirements.txt --
--- pip freeze > requirements.txt
+cd backend  
+pip install -r requirements.txt  
+pip freeze > requirements.txt
