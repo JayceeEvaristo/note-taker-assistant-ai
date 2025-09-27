@@ -1,172 +1,162 @@
 from fastapi import FastAPI, File, UploadFile
-import shutil, os, whisper, subprocess
+import shutil, os, subprocess, time
 from transformers import pipeline, AutoTokenizer, AutoModelForSeq2SeqLM
-from concurrent.futures import ThreadPoolExecutor
-import multiprocessing
-
 from faster_whisper import WhisperModel
-
 from transcribe import transcribe_file
-
-
-import time
+import itertools
 
 app = FastAPI()
 
-# transcribing model
-# model = whisper.load_model("base")
-model = WhisperModel("base", device="cpu", compute_type="int8")
+# ---------------------------
+# 📌 Model loading (GPU aware)
+# ---------------------------
 
+# Whisper (use int8 float16 mix to fit GPU comfortably)
+whisper_model = WhisperModel("large-v3", device="cuda", compute_type="float16")
+
+# Summarizer (BART)
 s_model = "facebook/bart-large-cnn"
 summarizer_tokenizer = AutoTokenizer.from_pretrained(s_model)
 summarizer_model = AutoModelForSeq2SeqLM.from_pretrained(s_model)
+summarizer = pipeline(
+    "summarization",
+    model=summarizer_model,
+    tokenizer=summarizer_tokenizer,
+    device=0
+)
 
+# Note taker (FLAN-T5)
 n_model = "google/flan-t5-base"
 n_tokenizer = AutoTokenizer.from_pretrained(n_model)
-n_model = AutoModelForSeq2SeqLM.from_pretrained(n_model)
+note_taker = pipeline(
+    "text2text-generation",
+    model=n_model,
+    tokenizer=n_tokenizer,
+    device=0
+)
 
+# ---------------------------
+# 📌 Helpers
+# ---------------------------
 
-summarizer = pipeline("summarization", model=summarizer_model, tokenizer=summarizer_tokenizer, device=-1)
-note_taker = pipeline("text2text-generation", model=n_model, tokenizer=n_tokenizer, device=-1)
+def chunk_text_by_tokens(text: str, tokenizer, max_tokens=None, stride=50):
+    """Chunk transcript safely by tokens, not words."""
+    if max_tokens is None:
+        max_tokens = getattr(tokenizer, "model_max_length", 512)
+        if max_tokens > 4096:  # some return sentinel like 1e30
+            max_tokens = 1024
 
-max_worker = multiprocessing.cpu_count()
+    token_ids = tokenizer.encode(text, add_special_tokens=False)
+    if len(token_ids) <= max_tokens:
+        return [text]
 
-def summarize_text(text):
-    return summarizer(text, min_length=5, max_length=500, do_sample=False)
-
-def chunk_text(text, max_tokens=500):
-    """
-    Split text into chunks that fit within the model's max token length.
-    Using 900 instead of 1024 for safety margin.
-    """
-    words = text.split()
-    chunks = []
-    current_chunk = []
-    token_count = 0
-
-    for word in words:
-        current_chunk.append(word)
-        # Count tokens if we added this word
-        tokens = summarizer_tokenizer(" ".join(current_chunk), return_tensors="pt")["input_ids"].shape[1]
-        if tokens >= max_tokens:
-            # Commit chunk and reset
-            chunks.append(" ".join(current_chunk[:-1]))
-            current_chunk = [word]
-
-    if current_chunk:
-        chunks.append(" ".join(current_chunk))
-
+    chunks, step = [], max_tokens - stride
+    for start in range(0, len(token_ids), step):
+        chunk_ids = token_ids[start:start + max_tokens]
+        chunk_text = tokenizer.decode(
+            chunk_ids,
+            skip_special_tokens=True,
+            clean_up_tokenization_spaces=True
+        )
+        chunks.append(chunk_text)
+        if start + max_tokens >= len(token_ids):
+            break
     return chunks
 
-def summarize_chunk(chunk: str):
-    """Summarize a single text chunk into bullet points."""
-    prompt = f"Summarize the following text into important bullet points, stick to the language that the text is written in:\n\n{chunk}"
-    result = summarizer(prompt, max_new_tokens=150, min_length=10, do_sample=False)
-    text = result[0]["summary_text"]
 
-    # Ensure bullet formatting
-    bullets = [f"• {line.strip()}" for line in text.split("\n") if line.strip()]
-    return "\n".join(bullets)
-
-def notes_chunk(chunk: str):
-    """Notes-style summarization (very important points only)."""
-    prompt = f"""
-    From the following text, extract only the very important points and write them as concise notes.
-    - Use bullet points
-    - Focus on facts, decisions, and action items
-    - Ignore filler content
-    - Stick to the language that the text is written in
-
-    Text:
-    {chunk}
-    """
-
-    result = note_taker(prompt, max_new_tokens=150, min_length=10, do_sample=False)
-    text = result[0]["generated_text"]   # <- not summary_text
-
-    bullets = [f"• {line.strip()}" for line in text.split("\n") if line.strip()]
-    return "\n".join(bullets)
-
+def batch_iterable(iterable, bsize):
+    it = iter(iterable)
+    while True:
+        batch = list(itertools.islice(it, bsize))
+        if not batch:
+            break
+        yield batch
 
 
 def convert_file(file: UploadFile):
+    """Convert uploaded file to mp3 audio."""
     if not file:
         raise ValueError("No file received")
-    
-    print(f"Received file: {file.filename}")
 
     temp_file = f"temp_{file.filename}"
     with open(temp_file, "wb") as buffer:
         shutil.copyfileobj(file.file, buffer)
 
     ext = os.path.splitext(temp_file)[1].lower()
-    if ext == ".mp4" or ext == ".mkv" or ext == ".webm" or ext == ".avi" or ext == ".mov":
+    if ext in [".mp4", ".mkv", ".webm", ".avi", ".mov"]:
         audio_file = f"{os.path.splitext(temp_file)[0]}.mp3"
         subprocess.run(
-            ["ffmpeg", "-y", "-i", temp_file, audio_file],
+            ["ffmpeg", "-y", "-i", temp_file, "-vn", "-acodec", "libmp3lame", "-q:a", "2", audio_file],
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
             check=True
         )
-        os.remove(temp_file)  # cleanup original
+        os.remove(temp_file)
         return audio_file
-    elif ext == ".mp3" or ext == ".wav" or ext == ".ogg" or ext == ".flac":
+    elif ext in [".mp3", ".wav", ".ogg", ".flac"]:
         return temp_file
     else:
         os.remove(temp_file)
         raise ValueError("Unsupported file format")
 
+
+# ---------------------------
+# 📌 FastAPI Endpoint
+# ---------------------------
+
 @app.post("/start/")
 async def transcribe(file: UploadFile = File(...)):
     start = time.time()
-    if not file:
-        return {"error": "No file received"}
+    audio_file = convert_file(file)
 
-    audio_file = convert_file(file)  # returns .mp3 path
-
-    #transcribe
-    transcript_text = transcribe_file(audio_file)
-
-    # return {"transcript": transcript_text, "time": time.time() - start}
-
-
-    # try:
-    #     # Step 1: Transcribe
-    #     print("Starting transcription...")
-    #     t1 = time.time()
-    #     segments, info = model.transcribe(audio_file)
-    #     transcript_text = " ".join([seg.text for seg in segments])
-    #     t2 = time.time()
-    #     print(f"Transcription done in {t2 - t1:.2f} sec")
-
-        # Step 2: Chunking
     try:
-        chunks = chunk_text(transcript_text)
+        # 1️⃣ Transcribe
+        print("Starting transcription...")
+        transcript_text = transcribe_file(audio_file)
 
-        # Step 3: Parallel summarization
-        print("Starting summarization...")
-        with ThreadPoolExecutor(max_workers=max_worker) as executor:
-            summaries = list(executor.map(summarize_chunk, chunks))
-        final_summary = " ".join(summaries)
+        # 2️⃣ Chunk text (safe < 512 tokens for BART)
+        chunks = chunk_text_by_tokens(transcript_text, summarizer_tokenizer, max_tokens=500, stride=50)
 
-        # Step 4: Generate notes
+        # 3️⃣ Summarization (batch on GPU)
+        print("Summarizing...")
+        summaries = []
+        for batch in batch_iterable(chunks, bsize=4):  # adjust bsize depending on VRAM
+            outs = summarizer(batch, truncation=True, max_length=180, min_length=20, do_sample=False)
+            for out in outs:
+                text = out.get("summary_text", "").strip()
+                if text:
+                    summaries.append("\n".join(f"• {line.strip()}" for line in text.split("\n") if line.strip()))
+        final_summary = "\n\n".join(summaries)
+
+        # 4️⃣ Notes (batch on GPU)
         print("Generating notes...")
-        with ThreadPoolExecutor(max_workers=max_worker) as executor:
-            notes = list(executor.map(notes_chunk, chunks))
-        final_notes = " ".join(notes)
+        notes = []
+        for batch in batch_iterable(chunks, bsize=4):
+            prompts = [
+                f"""Extract key points as clear, concise bullet notes.
+                - Focus only on facts, decisions, and action items
+                - No filler or repeated meta-instructions
 
-        print(f"Done in {time.time() - start:.2f} sec")
+                Text:
+                {ch}""" for ch in batch
+            ]
+            outs = note_taker(prompts, truncation=True, max_length=180, min_length=15, do_sample=False)
+            for out in outs:
+                text = out.get("generated_text", "").strip()
+                if text:
+                    notes.append("\n".join(f"• {line.strip()}" for line in text.split("\n") if line.strip()))
+        final_notes = "\n\n".join(notes)
+
+        duration = time.time() - start
+        print(f"Done in {duration:.2f} sec")
 
     finally:
-        # Cleanup
         if os.path.exists(audio_file):
             os.remove(audio_file)
 
     return {
         "transcript": transcript_text,
         "summary": final_summary,
-        "notes": final_notes
+        "notes": final_notes,
+        "time": duration
     }
-
-    
-

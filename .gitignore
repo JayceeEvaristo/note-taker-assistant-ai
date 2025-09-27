@@ -1,5 +1,6 @@
 backend/onnx_model/*.onnx
 backend/venv
+backend/__pycache__
 venv/
 
 frontend/node_modules
